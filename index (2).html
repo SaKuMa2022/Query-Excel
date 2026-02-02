@@ -1,0 +1,1135 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>SheetChat — Query Your Excel</title>
+<!--
+  Self-contained XLSX + CSV parser — zero external dependencies.
+  Exposes the same two entry-points the rest of the app uses:
+    XLSX.read(arrayBuffer)              → { SheetNames, Sheets }
+    XLSX.utils.sheet_to_json(sheet)     → [ { col: val }, … ]
+  .xlsx = ZIP of XML files; parsed with native DecompressionStream + manual local-header walking.
+-->
+<script>
+(function(){
+  // ───────────── ZIP PARSER (store + deflate, no external lib) ─────────────
+  async function unzip(buf) {
+    const view  = new DataView(buf);
+    const bytes = new Uint8Array(buf);
+    const files = {};
+    let offset  = 0;
+
+    while (offset + 4 <= buf.byteLength) {
+      const sig = view.getUint32(offset, true);
+      if (sig !== 0x04034b50) break;                       // not a local-file header
+
+      const method   = view.getUint16(offset + 8,  true);
+      const cSize    = view.getUint32(offset + 18, true);
+      const nameLen  = view.getUint16(offset + 26, true);
+      const extraLen = view.getUint16(offset + 28, true);
+      const name     = new TextDecoder().decode(bytes.slice(offset + 30, offset + 30 + nameLen));
+      const dataStart = offset + 30 + nameLen + extraLen;
+      const raw       = bytes.slice(dataStart, dataStart + cSize);
+
+      if (method === 0) {                                  // stored
+        files[name] = raw;
+      } else if (method === 8) {                           // deflated
+        const ds   = new DecompressionStream('deflate-raw');
+        const writer = ds.writable.getWriter();
+        writer.write(raw);
+        writer.close();
+        const reader = ds.readable.getReader();
+        const chunks = [];
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          chunks.push(value);
+        }
+        const total = chunks.reduce((s, c) => s + c.length, 0);
+        const out   = new Uint8Array(total);
+        let pos     = 0;
+        for (const c of chunks) { out.set(c, pos); pos += c.length; }
+        files[name] = out;
+      }
+      offset = dataStart + cSize;
+    }
+    return files;
+  }
+
+  // ───────────── SHARED-STRINGS XML PARSER ─────────────
+  function parseSST(xml) {
+    const strings = [];
+    // Match every <si>…</si> block, then pull text nodes out of <t> tags
+    const siRe = /<si>([\s\S]*?)<\/si>/g;
+    let m;
+    while ((m = siRe.exec(xml)) !== null) {
+      const inner = m[1];
+      // Collect all <t …>…</t> fragments (rich text can have multiple <t> inside one <si>)
+      const tRe  = /<t[^>]*>([\s\S]*?)<\/t>/g;
+      let t, str = '';
+      while ((t = tRe.exec(inner)) !== null) str += t[1];
+      strings.push(unescapeXml(str));
+    }
+    return strings;
+  }
+
+  // ───────────── SHEET XML PARSER ─────────────
+  function parseSheet(xml, sst) {
+    // Returns array-of-arrays: rows[rowIdx][colIdx] = value
+    const rows = [];
+    const rowRe = /<row[^>]*>([\s\S]*?)<\/row>/g;
+    let rm;
+    while ((rm = rowRe.exec(xml)) !== null) {
+      const rowIdx = parseInt(rm[0].match(/r="(\d+)"/)[1]) - 1;
+      // Ensure rows array is big enough
+      while (rows.length <= rowIdx) rows.push([]);
+
+      const cellRe = /<c ([^>]*)>([\s\S]*?)<\/c>/g;
+      let cm;
+      while ((cm = cellRe.exec(rm[1])) !== null) {
+        const attrs = cm[1];
+        const inner = cm[2];
+        const ref   = attrs.match(/r="([^"]+)"/)[1];
+        const colIdx = colLetterToIdx(ref.replace(/\d+/g,''));
+        const type  = (attrs.match(/t="([^"]*)"/) || [])[1] || '';
+        const vMatch = inner.match(/<v>([\s\S]*?)<\/v>/);
+        let val = vMatch ? vMatch[1] : '';
+
+        if (type === 's') {
+          // shared string index
+          val = sst[parseInt(val)] || '';
+        } else if (type === 'inlineStr') {
+          const isMatch = inner.match(/<t[^>]*>([\s\S]*?)<\/t>/);
+          val = isMatch ? unescapeXml(isMatch[1]) : '';
+        } else if (val !== '') {
+          // number — keep as number if possible
+          const n = Number(val);
+          if (!isNaN(n)) val = n;
+        }
+
+        while (rows[rowIdx].length <= colIdx) rows[rowIdx].push('');
+        rows[rowIdx][colIdx] = val;
+      }
+    }
+    return rows;
+  }
+
+  // ───────────── HELPERS ─────────────
+  function colLetterToIdx(letters) {
+    let idx = 0;
+    for (let i = 0; i < letters.length; i++)
+      idx = idx * 26 + (letters.charCodeAt(i) - 64);
+    return idx - 1;
+  }
+
+  function unescapeXml(s) {
+    return s.replace(/&amp;/g,'&').replace(/&lt;/g,'<').replace(/&gt;/g,'>').replace(/&quot;/g,'"').replace(/&apos;/g,"'");
+  }
+
+  // ───────────── CSV PARSER ─────────────
+  function parseCSV(text) {
+    const rows = [];
+    let row = [], field = '', inQuotes = false, i = 0;
+    while (i < text.length) {
+      const ch = text[i];
+      if (inQuotes) {
+        if (ch === '"') {
+          if (text[i+1] === '"') { field += '"'; i += 2; continue; }
+          inQuotes = false; i++; continue;
+        }
+        field += ch; i++; continue;
+      }
+      if (ch === '"') { inQuotes = true; i++; continue; }
+      if (ch === ',' || ch === '\t') { row.push(field); field = ''; i++; continue; }
+      if (ch === '\r' || ch === '\n') {
+        row.push(field); field = '';
+        if (row.some(v => v !== '')) rows.push(row);
+        row = [];
+        if (ch === '\r' && text[i+1] === '\n') i++;
+        i++; continue;
+      }
+      field += ch; i++;
+    }
+    row.push(field);
+    if (row.some(v => v !== '')) rows.push(row);
+    return rows;
+  }
+
+  // ───────────── sheet_to_json: convert rows[][] → [{ header: val }] ─────────────
+  function sheetToJson(sheet) {
+    if (!sheet || sheet.length < 2) return [];
+    const headers = sheet[0];
+    const result  = [];
+    for (let r = 1; r < sheet.length; r++) {
+      const obj = {};
+      let hasValue = false;
+      for (let c = 0; c < headers.length; c++) {
+        const val = (sheet[r] && sheet[r][c] != null) ? sheet[r][c] : '';
+        obj[headers[c] || ('Col' + (c+1))] = val;
+        if (val !== '') hasValue = true;
+      }
+      if (hasValue) result.push(obj);
+    }
+    return result;
+  }
+
+  // ───────────── PUBLIC API ─────────────
+  // read(arrayBuffer, opts) → { SheetNames: [...], Sheets: { name: rows[][] } }
+  // Supports .xlsx and .csv/.tsv detection by scanning content.
+  async function read(buf) {
+    const bytes = new Uint8Array(buf);
+
+    // .xlsx magic: PK\x03\x04
+    if (bytes[0]===0x50 && bytes[1]===0x4B && bytes[2]===0x03 && bytes[3]===0x04) {
+      const files = await unzip(buf);
+      const dec   = new TextDecoder();
+
+      // Shared strings (optional)
+      let sst = [];
+      const sstKey = Object.keys(files).find(k => /sharedStrings\.xml$/i.test(k));
+      if (sstKey) sst = parseSST(dec.decode(files[sstKey]));
+
+      // Sheet names come from workbook.xml
+      const wbKey   = Object.keys(files).find(k => /workbook\.xml$/i.test(k));
+      const wbXml   = dec.decode(files[wbKey]);
+      const sheetNames = [];
+      const shRe    = /<sheet [^>]*name="([^"]*)"[^>]*\/>/g;
+      let sm;
+      while ((sm = shRe.exec(wbXml)) !== null) sheetNames.push(unescapeXml(sm[1]));
+
+      // Parse each sheet file in order
+      const Sheets = {};
+      const sheetFiles = Object.keys(files)
+        .filter(k => /worksheets\/sheet\d+\.xml$/i.test(k))
+        .sort((a,b) => {
+          const na = parseInt(a.match(/sheet(\d+)/)[1]);
+          const nb = parseInt(b.match(/sheet(\d+)/)[1]);
+          return na - nb;
+        });
+
+      sheetFiles.forEach((key, i) => {
+        const name = sheetNames[i] || ('Sheet' + (i+1));
+        Sheets[name] = parseSheet(dec.decode(files[key]), sst);
+      });
+
+      return { SheetNames: sheetNames, Sheets: Sheets };
+    }
+
+    // Fallback: treat as CSV / TSV
+    const text = new TextDecoder().decode(bytes);
+    const rows = parseCSV(text);
+    return { SheetNames: ['Sheet1'], Sheets: { 'Sheet1': rows } };
+  }
+
+  // Expose the same interface the app expects
+  window.XLSX = {
+    read: function(buf) { return read(buf); },   // returns a Promise now
+    utils: { sheet_to_json: sheetToJson }
+  };
+})();
+</script>
+<style>
+  /* ─── Reset & Variables ─── */
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  :root {
+    --bg:          #0f1117;
+    --surface:     #1a1d27;
+    --surface2:    #232838;
+    --accent:      #5eead4;
+    --accent-dim:  rgba(94,234,212,.15);
+    --text:        #e2e8f0;
+    --text-dim:    #64748b;
+    --red:         #f87171;
+    --red-dim:     rgba(248,113,113,.12);
+    --radius:      12px;
+    --shadow:      0 4px 24px rgba(0,0,0,.35);
+  }
+
+  html, body {
+    height: 100%;
+    font-family: 'Segoe UI', system-ui, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    overflow: hidden;
+  }
+
+  /* ─── Layout Shell ─── */
+  .shell {
+    display: grid;
+    grid-template-columns: 300px 1fr;
+    grid-template-rows: 1fr;
+    height: 100vh;
+  }
+
+  /* ─── Sidebar ─── */
+  .sidebar {
+    background: var(--surface);
+    border-right: 1px solid var(--surface2);
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+
+  .sidebar-header {
+    padding: 24px 20px 16px;
+    border-bottom: 1px solid var(--surface2);
+  }
+
+  .sidebar-header h1 {
+    font-size: 1.25rem;
+    font-weight: 700;
+    letter-spacing: -.5px;
+    color: var(--accent);
+  }
+  .sidebar-header p {
+    font-size: .78rem;
+    color: var(--text-dim);
+    margin-top: 4px;
+    line-height: 1.4;
+  }
+
+  /* Upload zone */
+  .upload-zone {
+    margin: 16px;
+    border: 2px dashed var(--surface2);
+    border-radius: var(--radius);
+    padding: 20px 12px;
+    text-align: center;
+    cursor: pointer;
+    transition: border-color .2s, background .2s;
+    position: relative;
+  }
+  .upload-zone:hover, .upload-zone.drag-over {
+    border-color: var(--accent);
+    background: var(--accent-dim);
+  }
+  .upload-zone input { display:none; }
+  .upload-zone .icon { font-size: 1.8rem; color: var(--text-dim); }
+  .upload-zone .label { font-size: .78rem; color: var(--text-dim); margin-top: 6px; }
+  .upload-zone .label span { color: var(--accent); text-decoration: underline; cursor: pointer; }
+
+  /* Sheet tabs */
+  .sheet-tabs {
+    padding: 8px 16px 0;
+    display: flex;
+    gap: 6px;
+    flex-wrap: wrap;
+  }
+  .sheet-tab {
+    background: var(--surface2);
+    border: none;
+    color: var(--text-dim);
+    font-size: .72rem;
+    padding: 5px 10px;
+    border-radius: 6px;
+    cursor: pointer;
+    transition: background .2s, color .2s;
+  }
+  .sheet-tab:hover { background: var(--accent-dim); color: var(--accent); }
+  .sheet-tab.active { background: var(--accent-dim); color: var(--accent); font-weight: 600; }
+
+  /* Columns list */
+  .columns-panel {
+    padding: 16px;
+    overflow-y: auto;
+    flex: 1;
+  }
+  .columns-panel h3 {
+    font-size: .7rem;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    color: var(--text-dim);
+    margin-bottom: 8px;
+  }
+  .col-tag {
+    display: inline-block;
+    background: var(--surface2);
+    color: var(--text-dim);
+    font-size: .7rem;
+    padding: 3px 8px;
+    border-radius: 20px;
+    margin: 2px;
+  }
+
+  /* Suggestions */
+  .suggestions-panel { padding: 0 16px 16px; }
+  .suggestions-panel h3 {
+    font-size: .7rem;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    color: var(--text-dim);
+    margin-bottom: 8px;
+  }
+  .suggestion {
+    background: var(--surface2);
+    border: 1px solid transparent;
+    color: var(--text-dim);
+    font-size: .74rem;
+    padding: 7px 10px;
+    border-radius: 8px;
+    cursor: pointer;
+    margin-bottom: 5px;
+    transition: border-color .2s, color .2s, background .2s;
+  }
+  .suggestion:hover { border-color: var(--accent); color: var(--accent); background: var(--accent-dim); }
+
+  /* ─── Main Chat ─── */
+  .main {
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+
+  .chat-header {
+    padding: 18px 28px;
+    border-bottom: 1px solid var(--surface2);
+    background: var(--surface);
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+  .chat-header .status-dot {
+    width: 9px; height: 9px;
+    border-radius: 50%;
+    background: var(--text-dim);
+  }
+  .chat-header .status-dot.online { background: var(--accent); box-shadow: 0 0 6px var(--accent); }
+  .chat-header .status-text { font-size: .78rem; color: var(--text-dim); }
+
+  /* Messages */
+  .messages {
+    flex: 1;
+    overflow-y: auto;
+    padding: 24px 28px;
+    display: flex;
+    flex-direction: column;
+    gap: 18px;
+  }
+  .messages::-webkit-scrollbar { width: 6px; }
+  .messages::-webkit-scrollbar-track { background: transparent; }
+  .messages::-webkit-scrollbar-thumb { background: var(--surface2); border-radius: 3px; }
+
+  .msg {
+    display: flex;
+    gap: 12px;
+    animation: fadeUp .25s ease;
+  }
+  @keyframes fadeUp {
+    from { opacity:0; transform: translateY(8px); }
+    to   { opacity:1; transform: translateY(0); }
+  }
+  .msg.bot { flex-direction: row; }
+  .msg.user { flex-direction: row-reverse; }
+
+  .avatar {
+    width: 34px; height: 34px;
+    border-radius: 10px;
+    display: flex; align-items: center; justify-content: center;
+    font-size: .95rem;
+    flex-shrink: 0;
+  }
+  .avatar.bot { background: var(--accent-dim); color: var(--accent); }
+  .avatar.user { background: var(--surface2); color: var(--text-dim); }
+
+  .bubble {
+    max-width: 82%;
+    padding: 10px 14px;
+    border-radius: 14px;
+    font-size: .82rem;
+    line-height: 1.55;
+    word-break: break-word;
+  }
+  .bubble.bot {
+    background: var(--surface);
+    border: 1px solid var(--surface2);
+    color: var(--text);
+  }
+  .bubble.user {
+    background: var(--accent-dim);
+    border: 1px solid rgba(94,234,212,.25);
+    color: var(--accent);
+  }
+  .bubble.error {
+    background: var(--red-dim);
+    border-color: rgba(248,113,113,.25);
+    color: var(--red);
+  }
+
+  /* Result table */
+  .result-table-wrap {
+    overflow-x: auto;
+    margin-top: 10px;
+    border-radius: 8px;
+    border: 1px solid var(--surface2);
+  }
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: .74rem;
+  }
+  th {
+    background: var(--surface2);
+    color: var(--accent);
+    text-align: left;
+    padding: 7px 10px;
+    font-weight: 600;
+    white-space: nowrap;
+    border-bottom: 1px solid var(--surface2);
+  }
+  td {
+    padding: 6px 10px;
+    border-bottom: 1px solid rgba(35,40,56,.6);
+    color: var(--text);
+  }
+  tr:last-child td { border-bottom: none; }
+  tr:nth-child(even) td { background: rgba(26,29,39,.5); }
+
+  .result-count {
+    font-size: .68rem;
+    color: var(--text-dim);
+    margin-top: 6px;
+  }
+
+  /* Input bar */
+  .input-bar {
+    padding: 16px 24px 20px;
+    background: var(--bg);
+  }
+  .input-row {
+    display: flex;
+    gap: 10px;
+    background: var(--surface);
+    border: 1px solid var(--surface2);
+    border-radius: 14px;
+    padding: 8px 8px 8px 16px;
+    transition: border-color .2s;
+  }
+  .input-row:focus-within { border-color: var(--accent); }
+  .input-row input {
+    flex: 1;
+    background: transparent;
+    border: none;
+    outline: none;
+    color: var(--text);
+    font-size: .82rem;
+  }
+  .input-row input::placeholder { color: var(--text-dim); }
+  .input-row button {
+    background: var(--accent);
+    color: var(--bg);
+    border: none;
+    padding: 8px 18px;
+    border-radius: 10px;
+    font-size: .78rem;
+    font-weight: 600;
+    cursor: pointer;
+    transition: opacity .2s;
+  }
+  .input-row button:hover { opacity: .85; }
+  .input-row button:disabled { opacity: .35; cursor: default; }
+
+  .input-hint {
+    font-size: .68rem;
+    color: var(--text-dim);
+    margin-top: 8px;
+    padding-left: 4px;
+  }
+
+  /* Typing indicator */
+  .typing .dot {
+    display: inline-block;
+    width: 6px; height: 6px;
+    background: var(--text-dim);
+    border-radius: 50%;
+    margin: 0 2px;
+    animation: bounce .9s infinite;
+  }
+  .typing .dot:nth-child(2) { animation-delay: .15s; }
+  .typing .dot:nth-child(3) { animation-delay: .3s; }
+  @keyframes bounce {
+    0%,60%,100% { transform: translateY(0); }
+    30% { transform: translateY(-4px); }
+  }
+
+  /* ─── Responsive ─── */
+  @media (max-width: 700px) {
+    .shell { grid-template-columns: 1fr; grid-template-rows: auto 1fr; }
+    .sidebar { flex-direction: row; flex-wrap: wrap; max-height: 220px; overflow-y: auto; border-right: none; border-bottom: 1px solid var(--surface2); }
+    .sidebar-header { min-width: 200px; }
+    .upload-zone { margin: 8px; }
+  }
+</style>
+</head>
+<body>
+
+<div class="shell">
+  <!-- ─── SIDEBAR ─── -->
+  <aside class="sidebar">
+    <div class="sidebar-header">
+      <h1>⚡ SheetChat</h1>
+      <p>Load an Excel / CSV file and ask questions about your data in plain English.</p>
+    </div>
+
+    <div class="upload-zone" id="uploadZone">
+      <input type="file" id="fileInput" accept=".xlsx,.xls,.csv,.tsv" />
+      <div class="icon">📂</div>
+      <div class="label"><span>Click or drag</span> a file here</div>
+    </div>
+
+    <div class="sheet-tabs" id="sheetTabs"></div>
+
+    <div class="columns-panel" id="columnsPanel">
+      <h3>Columns</h3>
+      <div id="colTags" style="color:var(--text-dim);font-size:.72rem;">No file loaded</div>
+    </div>
+
+    <div class="suggestions-panel" id="suggestionsPanel">
+      <h3>Try asking</h3>
+      <div id="suggestions"></div>
+    </div>
+  </aside>
+
+  <!-- ─── MAIN CHAT ─── -->
+  <main class="main">
+    <div class="chat-header">
+      <div class="status-dot" id="statusDot"></div>
+      <span class="status-text" id="statusText">No file loaded — upload a spreadsheet to begin</span>
+    </div>
+
+    <div class="messages" id="messages">
+      <div class="msg bot">
+        <div class="avatar bot">🤖</div>
+        <div class="bubble bot">
+          Hi! I'm <strong>SheetChat</strong>. Upload an Excel or CSV file on the left, then ask me anything about your data — like totals, averages, filters, counts, max/min values, and more.<br/><br/>
+          Everything runs <em>locally in your browser</em> — no data is sent anywhere.
+        </div>
+      </div>
+    </div>
+
+    <div class="input-bar">
+      <div class="input-row">
+        <input type="text" id="queryInput" placeholder="Ask something about your data…" autocomplete="off" />
+        <button id="sendBtn" disabled>Send</button>
+      </div>
+      <div class="input-hint">Try: "show all rows where sales > 500" · "what is the average price?" · "how many unique categories?"</div>
+    </div>
+  </main>
+</div>
+
+<!-- ─── APP LOGIC ─── -->
+<script>
+(function(){
+  // ─── STATE ───
+  let workbook = null;          // parsed XLSX workbook
+  let sheetNames = [];
+  let activeSheet = '';
+  let data = [];                // array of objects (current sheet)
+  let headers = [];
+
+  // ─── DOM refs ───
+  const uploadZone   = document.getElementById('uploadZone');
+  const fileInput    = document.getElementById('fileInput');
+  const sheetTabs    = document.getElementById('sheetTabs');
+  const colTags      = document.getElementById('colTags');
+  const suggestions  = document.getElementById('suggestions');
+  const statusDot    = document.getElementById('statusDot');
+  const statusText   = document.getElementById('statusText');
+  const messagesEl   = document.getElementById('messages');
+  const queryInput   = document.getElementById('queryInput');
+  const sendBtn      = document.getElementById('sendBtn');
+
+  // ─── Upload handling ───
+  uploadZone.addEventListener('click', () => fileInput.click());
+  uploadZone.addEventListener('dragover', e => { e.preventDefault(); uploadZone.classList.add('drag-over'); });
+  uploadZone.addEventListener('dragleave', () => uploadZone.classList.remove('drag-over'));
+  uploadZone.addEventListener('drop', e => {
+    e.preventDefault();
+    uploadZone.classList.remove('drag-over');
+    if (e.dataTransfer.files[0]) loadFile(e.dataTransfer.files[0]);
+  });
+  fileInput.addEventListener('change', e => { if (e.target.files[0]) loadFile(e.target.files[0]); });
+
+  function loadFile(file) {
+    const reader = new FileReader();
+    reader.onload = function(ev) {
+      XLSX.read(ev.target.result).then(function(wb) {
+        workbook    = wb;
+        sheetNames  = wb.SheetNames;
+        activeSheet = sheetNames[0];
+        renderSheetTabs();
+        switchSheet(activeSheet);
+        setStatus(true, `Loaded "${file.name}" — ${sheetNames.length} sheet(s), ${data.length} row(s)`);
+        addMsg('bot', `✅ <strong>${file.name}</strong> loaded successfully.<br/>📊 <strong>${data.length}</strong> rows · <strong>${headers.length}</strong> columns · <strong>${sheetNames.length}</strong> sheet(s)<br/><br/>Feel free to ask me anything about this data!`);
+      }).catch(function(err) {
+        addMsg('bot', `❌ Could not parse the file (${err.message}). Please try a valid .xlsx or .csv.`, true);
+      });
+    };
+    reader.readAsArrayBuffer(file);
+  }
+
+  // ─── Sheet tabs ───
+  function renderSheetTabs() {
+    sheetTabs.innerHTML = sheetNames.map(n =>
+      `<button class="sheet-tab ${n===activeSheet?'active':''}" onclick="switchSheet('${n.replace(/'/g,"\\'")}')">${n}</button>`
+    ).join('');
+  }
+
+  function switchSheet(name) {
+    activeSheet = name;
+    const ws = workbook.Sheets[name];
+    data = XLSX.utils.sheet_to_json(ws, { defval: '' });
+    headers = data.length ? Object.keys(data[0]) : [];
+    renderSheetTabs();
+    renderColumns();
+    renderSuggestions();
+  }
+
+  // ─── Columns panel ───
+  function renderColumns() {
+    colTags.innerHTML = headers.map(h => `<span class="col-tag">${h}</span>`).join('');
+  }
+
+  // ─── Dynamic suggestions ───
+  function renderSuggestions() {
+    if (!headers.length) { suggestions.innerHTML=''; return; }
+    const h = headers;
+    const numCol = detectNumericColumn();
+    const catCol = detectCategoricColumn();
+    const tips = [];
+    tips.push(`Show all data`);
+    if (numCol) {
+      tips.push(`What is the average ${numCol}?`);
+      tips.push(`What is the total ${numCol}?`);
+      tips.push(`Show max ${numCol}`);
+      tips.push(`Show min ${numCol}`);
+    }
+    if (catCol && numCol) {
+      tips.push(`Group by ${catCol} and sum ${numCol}`);
+      tips.push(`How many unique ${catCol}?`);
+    }
+    if (numCol) tips.push(`Show rows where ${numCol} > 100`);
+    tips.push(`How many rows are there?`);
+    suggestions.innerHTML = tips.slice(0, 7).map(t =>
+      `<div class="suggestion" onclick="useSuggestion('${t.replace(/'/g,"\\'")}')">${t}</div>`
+    ).join('');
+  }
+
+  function useSuggestion(txt) {
+    queryInput.value = txt;
+    queryInput.focus();
+  }
+
+  // ─── Detect column types ───
+  function detectNumericColumn() {
+    for (const h of headers) {
+      const sample = data.slice(0, 20).map(r => r[h]);
+      if (sample.filter(v => !isNaN(parseFloat(v)) && v !== '').length > sample.filter(v=>v!=='').length * 0.6)
+        return h;
+    }
+    return null;
+  }
+
+  function detectCategoricColumn() {
+    for (const h of headers) {
+      const vals = data.map(r => String(r[h]));
+      const unique = new Set(vals);
+      if (unique.size > 1 && unique.size < data.length * 0.6 && vals.every(v => isNaN(parseFloat(v)) || v === ''))
+        return h;
+    }
+    // fallback: first column with few unique string values
+    for (const h of headers) {
+      const vals = data.map(r => String(r[h]));
+      const unique = new Set(vals);
+      if (unique.size > 1 && unique.size <= 30) return h;
+    }
+    return null;
+  }
+
+  // ─── Status bar ───
+  function setStatus(online, txt) {
+    statusDot.className = 'status-dot' + (online ? ' online' : '');
+    statusText.textContent = txt;
+  }
+
+  // ─── Chat messages ───
+  function addMsg(role, html, isErr) {
+    const msg = document.createElement('div');
+    msg.className = `msg ${role}`;
+    const avatar = role === 'bot' ? '🤖' : '👤';
+    const bubbleCls = isErr ? 'bubble bot error' : `bubble ${role}`;
+    msg.innerHTML = `<div class="avatar ${role}">${avatar}</div><div class="${bubbleCls}">${html}</div>`;
+    messagesEl.appendChild(msg);
+    messagesEl.scrollTop = messagesEl.scrollHeight;
+    return msg;
+  }
+
+  function addTyping() {
+    const msg = document.createElement('div');
+    msg.className = 'msg bot';
+    msg.innerHTML = `<div class="avatar bot">🤖</div><div class="bubble bot typing"><span class="dot"></span><span class="dot"></span><span class="dot"></span></div>`;
+    messagesEl.appendChild(msg);
+    messagesEl.scrollTop = messagesEl.scrollHeight;
+    return msg;
+  }
+
+  // ─── Input ───
+  queryInput.addEventListener('input', () => { sendBtn.disabled = !queryInput.value.trim(); });
+  queryInput.addEventListener('keydown', e => { if (e.key === 'Enter' && !sendBtn.disabled) handleQuery(); });
+  sendBtn.addEventListener('click', handleQuery);
+
+  // ─── QUERY ENGINE ───
+  function handleQuery() {
+    const raw = queryInput.value.trim();
+    if (!raw) return;
+    queryInput.value = '';
+    sendBtn.disabled = true;
+    addMsg('user', raw);
+
+    if (!data.length) {
+      addMsg('bot', '⚠️ No data loaded. Please upload an Excel or CSV file first.', true);
+      return;
+    }
+
+    const typing = addTyping();
+    setTimeout(() => {
+      typing.remove();
+      try {
+        const result = parseAndExecute(raw);
+        addMsg('bot', result);
+      } catch(e) {
+        addMsg('bot', `🤔 I couldn't understand that query. Try asking things like:<br/><em>"show all rows" · "average of [column]" · "filter by [column] > value" · "count" · "group by [column]"</em>`, true);
+      }
+      messagesEl.scrollTop = messagesEl.scrollHeight;
+    }, 400 + Math.random()*300);
+  }
+
+  // ─── PARSER & EXECUTOR ───
+  function parseAndExecute(q) {
+    const orig = q;
+    q = q.toLowerCase().trim().replace(/[?!.]+$/g,'').trim();
+
+    // ── ROW COUNT ──
+    if (/how many (rows|records|entries|items|data points)/.test(q) || q === 'count' || q === 'how many rows' || /^(total|count) (of )?rows/.test(q)) {
+      return `📊 There are <strong>${data.length}</strong> row(s) in the current sheet.`;
+    }
+
+    // ── COLUMN COUNT ──
+    if (/how many (columns|fields|headers)/.test(q)) {
+      return `📊 There are <strong>${headers.length}</strong> columns: ${headers.map(h=>'<em>'+h+'</em>').join(', ')}.`;
+    }
+
+    // ── SHOW ALL ──
+    if (/^show (all|the)?\s*(data|rows|everything|table)?\s*$/.test(q) || q === 'show all') {
+      return renderTable(data);
+    }
+
+    // ── UNIQUE / DISTINCT ──
+    const uniqueM = q.match(/(?:how many |count )?(unique|distinct)\s+(.+)/);
+    if (uniqueM) {
+      const col = matchColumn(uniqueM[2]);
+      if (col) {
+        const unique = [...new Set(data.map(r => String(r[col])))];
+        return `🏷️ <strong>${unique.length}</strong> unique value(s) in <em>${col}</em>:<br/><br/>` + unique.map(v=>`<span style="background:var(--surface2);padding:3px 8px;border-radius:5px;margin:2px;display:inline-block;font-size:.73rem;">${v}</span>`).join(' ');
+      }
+    }
+
+    // ── AGGREGATE: sum / total ──
+    const sumM = q.match(/(?:what is the |calculate |get |show )?(total|sum) (?:of )?(.+)/);
+    if (sumM) {
+      const col = matchColumn(sumM[2]);
+      if (col) {
+        const sum = data.reduce((a, r) => a + toNum(r[col]), 0);
+        return `🔢 The <strong>total</strong> of <em>${col}</em> is <strong>${fmt(sum)}</strong>.`;
+      }
+    }
+
+    // ── AGGREGATE: average / mean ──
+    const avgM = q.match(/(?:what is the |calculate |get |show )?(average|mean|avg) (?:of )?(.+)/);
+    if (avgM) {
+      const col = matchColumn(avgM[2]);
+      if (col) {
+        const nums = data.map(r => toNum(r[col])).filter(n => !isNaN(n));
+        const avg = nums.length ? nums.reduce((a,b)=>a+b,0)/nums.length : 0;
+        return `📈 The <strong>average</strong> of <em>${col}</em> is <strong>${fmt(avg)}</strong> (across ${nums.length} numeric values).`;
+      }
+    }
+
+    // ── AGGREGATE: max ──
+    const maxM = q.match(/(?:what is the |show |get )?(max|maximum|highest|largest|biggest|top) (?:value (?:of |in )|(?:of |in ))?(.+)/);
+    if (maxM) {
+      const col = matchColumn(maxM[2]);
+      if (col) {
+        const nums = data.map(r => ({ val: toNum(r[col]), row: r })).filter(x=>!isNaN(x.val));
+        if (nums.length) {
+          const mx = nums.reduce((a,b) => a.val>b.val?a:b);
+          return `🏆 The <strong>maximum</strong> value in <em>${col}</em> is <strong>${fmt(mx.val)}</strong>.` + renderTable([mx.row], true);
+        }
+      }
+    }
+
+    // ── AGGREGATE: min ──
+    const minM = q.match(/(?:what is the |show |get )?(min|minimum|lowest|smallest|least|bottom) (?:value (?:of |in )|(?:of |in ))?(.+)/);
+    if (minM) {
+      const col = matchColumn(minM[2]);
+      if (col) {
+        const nums = data.map(r => ({ val: toNum(r[col]), row: r })).filter(x=>!isNaN(x.val));
+        if (nums.length) {
+          const mn = nums.reduce((a,b) => a.val<b.val?a:b);
+          return `📉 The <strong>minimum</strong> value in <em>${col}</em> is <strong>${fmt(mn.val)}</strong>.` + renderTable([mn.row], true);
+        }
+      }
+    }
+
+    // ── AGGREGATE: count where ──
+    const countWhM = q.match(/(?:how many |count )(?:rows )?(?:where |with |have |has )(.+)/);
+    if (countWhM) {
+      const filtered = applyFilter(countWhM[1]);
+      if (filtered) return `🔢 <strong>${filtered.length}</strong> row(s) match that condition.`;
+    }
+
+    // ── FILTER: show/filter/find rows where ──
+    const filterM = q.match(/(?:show |filter |find |list |display |get )?(?:rows? |records? |entries? |items? )?(?:where |with |that have |having |if )(.+)/);
+    if (filterM) {
+      const filtered = applyFilter(filterM[1]);
+      if (filtered) {
+        if (filtered.length === 0)
+          return `🔍 No rows match that condition.`;
+        return `🔍 Found <strong>${filtered.length}</strong> matching row(s):` + renderTable(filtered);
+      }
+    }
+
+    // ── GROUP BY + aggregate ──
+    const groupM = q.match(/group (?:by |on )(.+?)(?:\s+(?:and|,)\s+(?:sum|total|average|avg|count|max|min)\s+(.+))?$/);
+    if (groupM) {
+      const col = matchColumn(groupM[1].replace(/\s+(and|,)\s+.+/i,''));
+      const aggPart = groupM[0];
+      let aggType = 'count', aggCol = null;
+      const aggM2 = aggPart.match(/(?:and|,)\s+(sum|total|average|avg|count|max|min)\s+(.+)$/);
+      if (aggM2) { aggType = aggM2[1]; aggCol = matchColumn(aggM2[2]); }
+      if (col) {
+        const groups = {};
+        data.forEach(r => {
+          const key = String(r[col]);
+          if (!groups[key]) groups[key] = [];
+          groups[key].push(r);
+        });
+        const rows = Object.entries(groups).map(([key, items]) => {
+          const row = { [col]: key };
+          if (aggType === 'count') { row['count'] = items.length; }
+          else if (aggCol) {
+            const nums = items.map(i => toNum(i[aggCol])).filter(n=>!isNaN(n));
+            if (aggType === 'sum' || aggType === 'total') row[`sum_${aggCol}`] = fmt(nums.reduce((a,b)=>a+b,0));
+            else if (aggType === 'average' || aggType === 'avg') row[`avg_${aggCol}`] = fmt(nums.length ? nums.reduce((a,b)=>a+b,0)/nums.length : 0);
+            else if (aggType === 'max') row[`max_${aggCol}`] = fmt(Math.max(...nums));
+            else if (aggType === 'min') row[`min_${aggCol}`] = fmt(Math.min(...nums));
+          }
+          return row;
+        });
+        return `📂 Grouped by <em>${col}</em>:` + renderTable(rows);
+      }
+    }
+
+    // ── TOP / BOTTOM N ──
+    const topM = q.match(/(?:show |get |list )?(top|bottom|first|last)\s+(\d+)\s+(?:rows? )?(?:by |(?:of |in ))?(.+)/);
+    if (topM) {
+      const dir = (topM[1]==='bottom'||topM[1]==='last') ? 'asc' : 'desc';
+      const n = parseInt(topM[2]);
+      const col = matchColumn(topM[3]);
+      if (col) {
+        const sorted = [...data].sort((a,b) => {
+          const av = toNum(a[col]), bv = toNum(b[col]);
+          return dir === 'desc' ? bv - av : av - bv;
+        });
+        return `📋 <strong>${topM[1].charAt(0).toUpperCase()+topM[1].slice(1)} ${n}</strong> by <em>${col}</em>:` + renderTable(sorted.slice(0, n));
+      }
+    }
+
+    // ── SORT ──
+    const sortM = q.match(/sort (?:by |on )(.+?)(?:\s+(asc|desc|ascending|descending))?$/);
+    if (sortM) {
+      const col = matchColumn(sortM[1]);
+      const dir = (sortM[2]||'asc').startsWith('desc') ? 'desc' : 'asc';
+      if (col) {
+        const sorted = [...data].sort((a,b) => {
+          const av = toNum(a[col]), bv = toNum(b[col]);
+          if (!isNaN(av) && !isNaN(bv)) return dir==='desc' ? bv-av : av-bv;
+          return dir==='desc' ? String(b[col]).localeCompare(String(a[col])) : String(a[col]).localeCompare(String(b[col]));
+        });
+        return `📋 Sorted by <em>${col}</em> (${dir}):` + renderTable(sorted);
+      }
+    }
+
+    // ── LIST COLUMNS ──
+    if (/(?:what are |show |list )?(the )?columns?/.test(q) || q === 'columns' || q === 'headers') {
+      return `📑 Columns in this sheet:<br/><br/>` + headers.map((h,i) => `<strong>${i+1}.</strong> ${h}`).join('<br/>');
+    }
+
+    // ── SHEET INFO ──
+    if (/(?:what are |show |list )?(the )?sheets?/.test(q) || q === 'sheets') {
+      return `📂 Sheets in this workbook:<br/><br/>` + sheetNames.map((s,i) => `<strong>${i+1}.</strong> ${s}${s===activeSheet?' ← (active)':''}`).join('<br/>');
+    }
+
+    // ── SAMPLE ──
+    if (/(?:show |give )?(me )?(a )?sample|first (\d+)/.test(q)) {
+      const nM = q.match(/first\s+(\d+)/);
+      const n = nM ? parseInt(nM[1]) : 5;
+      return `📋 First <strong>${Math.min(n, data.length)}</strong> row(s):` + renderTable(data.slice(0, n));
+    }
+
+    // ── HELP ──
+    if (/help|what can you do|capabilities/.test(q)) {
+      return `🧭 Here's what I can do:<br/><br/>
+        <strong>Aggregates:</strong> average, sum/total, max/min, count<br/>
+        <strong>Filtering:</strong> show rows where [col] > / < / = / contains value<br/>
+        <strong>Sorting:</strong> sort by [column] asc/desc<br/>
+        <strong>Top/Bottom:</strong> top 10 by [column]<br/>
+        <strong>Grouping:</strong> group by [column] and sum/avg/count [column]<br/>
+        <strong>Unique:</strong> how many unique [column]<br/>
+        <strong>Info:</strong> how many rows, list columns, show sample<br/><br/>
+        💡 Just type in plain English!`;
+    }
+
+    // ── FALLBACK: try to match a single column name and show it ──
+    const singleCol = matchColumn(q);
+    if (singleCol) {
+      const vals = data.map(r => r[singleCol]);
+      const nums = vals.map(v=>toNum(v)).filter(n=>!isNaN(n));
+      let info = `📊 Column <em>${singleCol}</em>:<br/><br/><strong>Rows:</strong> ${data.length}`;
+      if (nums.length) info += `<br/><strong>Sum:</strong> ${fmt(nums.reduce((a,b)=>a+b,0))} · <strong>Avg:</strong> ${fmt(nums.reduce((a,b)=>a+b,0)/nums.length)} · <strong>Min:</strong> ${fmt(Math.min(...nums))} · <strong>Max:</strong> ${fmt(Math.max(...nums))}`;
+      const unique = new Set(vals.map(String));
+      info += `<br/><strong>Unique values:</strong> ${unique.size}`;
+      return info;
+    }
+
+    throw new Error('unhandled');
+  }
+
+  // ─── FILTER PARSER ───
+  function applyFilter(clause) {
+    // col operator value
+    // operators: >, <, >=, <=, =, ==, !=, contains, includes, starts with, ends with, is, is not
+    clause = clause.trim();
+
+    // Try: [col] [op] [value]
+    let m;
+
+    // numeric comparisons
+    m = clause.match(/^(.+?)\s*(>=|<=|!=|>|<|=|==)\s*(.+)$/);
+    if (m) {
+      const col = matchColumn(m[1]);
+      const op = m[2];
+      const val = m[3].replace(/^["']|["']$/g,'');
+      if (col) {
+        return data.filter(r => {
+          const cv = toNum(r[col]), nv = toNum(val);
+          if (!isNaN(cv) && !isNaN(nv)) {
+            if (op === '>' || op === 'greater') return cv > nv;
+            if (op === '<') return cv < nv;
+            if (op === '>=') return cv >= nv;
+            if (op === '<=') return cv <= nv;
+            if (op === '=' || op === '==') return cv === nv;
+            if (op === '!=') return cv !== nv;
+          }
+          // string fallback
+          const sv = String(r[col]).toLowerCase(), tv = val.toLowerCase();
+          if (op === '=' || op === '==') return sv === tv;
+          if (op === '!=') return sv !== tv;
+          return false;
+        });
+      }
+    }
+
+    // contains / includes
+    m = clause.match(/^(.+?)\s+(?:contains?|includes?)\s+["']?(.+?)["']?$/i);
+    if (m) {
+      const col = matchColumn(m[1]);
+      const val = m[2].toLowerCase();
+      if (col) return data.filter(r => String(r[col]).toLowerCase().includes(val));
+    }
+
+    // starts with
+    m = clause.match(/^(.+?)\s+(?:starts? with)\s+["']?(.+?)["']?$/i);
+    if (m) {
+      const col = matchColumn(m[1]);
+      const val = m[2].toLowerCase();
+      if (col) return data.filter(r => String(r[col]).toLowerCase().startsWith(val));
+    }
+
+    // ends with
+    m = clause.match(/^(.+?)\s+(?:ends? with)\s+["']?(.+?)["']?$/i);
+    if (m) {
+      const col = matchColumn(m[1]);
+      const val = m[2].toLowerCase();
+      if (col) return data.filter(r => String(r[col]).toLowerCase().endsWith(val));
+    }
+
+    // is / is not
+    m = clause.match(/^(.+?)\s+is\s+not\s+["']?(.+?)["']?$/i);
+    if (m) {
+      const col = matchColumn(m[1]);
+      const val = m[2].toLowerCase();
+      if (col) return data.filter(r => String(r[col]).toLowerCase() !== val);
+    }
+    m = clause.match(/^(.+?)\s+is\s+["']?(.+?)["']?$/i);
+    if (m) {
+      const col = matchColumn(m[1]);
+      const val = m[2].toLowerCase();
+      if (col) return data.filter(r => String(r[col]).toLowerCase() === val);
+    }
+
+    return null;
+  }
+
+  // ─── UTILS ───
+  function matchColumn(text) {
+    if (!text) return null;
+    text = text.trim().replace(/[,.]$/g,'').toLowerCase();
+    // exact match
+    let found = headers.find(h => h.toLowerCase() === text);
+    if (found) return found;
+    // partial / includes
+    found = headers.find(h => h.toLowerCase().includes(text) || text.includes(h.toLowerCase()));
+    if (found) return found;
+    // try each word
+    const words = text.split(/\s+/);
+    for (const w of words) {
+      if (w.length < 3) continue;
+      found = headers.find(h => h.toLowerCase().includes(w));
+      if (found) return found;
+    }
+    return null;
+  }
+
+  function toNum(v) {
+    if (v === '' || v == null) return NaN;
+    const n = Number(String(v).replace(/[,$%]/g,''));
+    return n;
+  }
+
+  function fmt(n) {
+    if (isNaN(n)) return '—';
+    if (Number.isInteger(n)) return n.toLocaleString();
+    return n.toLocaleString(undefined, { maximumFractionDigits: 2 });
+  }
+
+  function renderTable(rows, compact) {
+    if (!rows.length) return '<div style="color:var(--text-dim);font-size:.74rem;margin-top:8px;">No data to display.</div>';
+    const cols = Object.keys(rows[0]);
+    const maxRows = compact ? rows.length : Math.min(rows.length, 200);
+    let html = `<div class="result-table-wrap" style="margin-top:12px;"><table><thead><tr>${cols.map(c=>`<th>${c}</th>`).join('')}</tr></thead><tbody>`;
+    for (let i = 0; i < maxRows; i++) {
+      html += `<tr>${cols.map(c=>`<td>${rows[i][c]}</td>`).join('')}</tr>`;
+    }
+    html += '</tbody></table></div>';
+    html += `<div class="result-count">Showing ${maxRows} of ${rows.length} row(s)</div>`;
+    return html;
+  }
+
+  // ─── INIT ───
+  setStatus(false, 'Upload a file to begin');
+})();
+</script>
+</body>
+</html>
